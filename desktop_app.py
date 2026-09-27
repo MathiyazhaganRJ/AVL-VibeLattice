@@ -5,11 +5,15 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QPushButton, QLabel, QSplitter, QHeaderView,
                              QTabWidget, QComboBox, QLineEdit, QCheckBox, 
                              QGridLayout, QFileDialog, QMessageBox, QGroupBox, QPlainTextEdit, QProgressBar, QScrollArea, QFrame, QListView, QInputDialog, QMenu, QAction)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl
 from PyQt5.QtGui import QTextCursor, QTextCharFormat, QColor, QFont, QIcon
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineProfile, QWebEnginePage
 import os
 import subprocess
 import json
+import threading
+import http.server
+import socketserver
 from dataclasses import asdict
 import matplotlib
 import webbrowser
@@ -80,6 +84,37 @@ class AlphaSweepWorker(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
+def get_free_port():
+    with socketserver.TCPServer(("localhost", 0), None) as s:
+        return s.server_address[1]
+
+class VibeLatticeServer(threading.Thread):
+    def __init__(self, directory, port):
+        super().__init__()
+        self.directory = directory
+        self.port = port
+        self.daemon = True
+        
+    def run(self):
+        os.chdir(self.directory)
+        
+        class CustomHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                
+            def end_headers(self):
+                self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
+                self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+                super().end_headers()
+                
+            def log_message(self, format, *args):
+                pass # suppress logs
+
+        CustomHandler.extensions_map.update({".wasm": "application/wasm"})
+                
+        with socketserver.TCPServer(("", self.port), CustomHandler) as httpd:
+            httpd.serve_forever()
+
 class AVLDesktopApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -90,33 +125,52 @@ class AVLDesktopApp(QMainWindow):
         self.last_directory = ""
         self.init_data_model()
 
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        main_layout = QVBoxLayout(main_widget)
+        # Start VibeLattice Server
+        vibelattice_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "vibelattice"))
+        if not os.path.exists(vibelattice_dir):
+            print(f"Warning: Could not find VibeLattice at {vibelattice_dir}")
+        else:
+            self.vibe_port = get_free_port()
+            self.vibe_server = VibeLatticeServer(vibelattice_dir, self.vibe_port)
+            self.vibe_server.start()
+
+        # Set up Tabbed Interface
+        self.main_tabs = QTabWidget()
+        self.setCentralWidget(self.main_tabs)
+        
+        # 1. Geometry Builder Tab
+        builder_tab = QWidget()
+        self.main_tabs.addTab(builder_tab, "Geometry Builder")
+        main_layout = QVBoxLayout(builder_tab)
         main_layout.setContentsMargins(12, 12, 12, 12)
         main_layout.setSpacing(12)
-        
-
         
         top_bar = QHBoxLayout()
         btn_load = QPushButton("Load Project")
         btn_save = QPushButton("Save Project")
+        btn_push_vibe = QPushButton("Push to VibeLattice")
+        btn_push_vibe.setStyleSheet("background-color: #0071E3; color: white; font-weight: bold;")
         btn_docs = QPushButton("AVL Documentation")
         chk_dark = QCheckBox("Dark Mode")
         chk_dark.setChecked(True)
         
         btn_load.clicked.connect(self.load_project)
         btn_save.clicked.connect(self.save_project)
+        btn_push_vibe.clicked.connect(self.push_to_vibelattice)
         btn_docs.clicked.connect(lambda: webbrowser.open("https://web.mit.edu/drela/Public/web/avl/"))
         chk_dark.stateChanged.connect(lambda state: self.apply_theme(state == Qt.Checked))
         
         top_bar.addWidget(btn_load)
         top_bar.addWidget(btn_save)
+        top_bar.addWidget(btn_push_vibe)
         top_bar.addWidget(btn_docs)
         top_bar.addStretch()
         top_bar.addWidget(chk_dark)
         
         main_layout.addLayout(top_bar)
+        
+        # 2. VibeLattice Simulator Tab
+        self.setup_vibelattice_tab()
         
         splitter = QSplitter(Qt.Horizontal)
         main_layout.addWidget(splitter, 1)
@@ -1454,15 +1508,37 @@ class AVLDesktopApp(QMainWindow):
     def save_project(self):
         self.plane.description = self.txt_notes.toPlainText()
         options = QFileDialog.Options()
-        default_path = os.path.join(self.last_directory, f"{self.plane.name.replace(' ','_')}_project.json") if self.last_directory else f"{self.plane.name.replace(' ','_')}_project.json"
+        base_name = self.plane.name.replace(' ','_')
+        default_path = os.path.join(self.last_directory, f"{base_name}_project.json") if self.last_directory else f"{base_name}_project.json"
         filepath, _ = QFileDialog.getSaveFileName(self, "Save Project", default_path, "JSON Files (*.json)", options=options)
         if not filepath: return
         self.last_directory = os.path.dirname(filepath)
         try:
+            # 1. Save JSON Project state
             data = asdict(self.plane)
             with open(filepath, 'w') as f:
                 json.dump(data, f, indent=4)
-            QMessageBox.information(self, "Success", f"Project saved to {filepath}")
+                
+            # 2. Save .avl Geometry File
+            avl_filepath = filepath.replace('_project.json', '.avl').replace('.json', '.avl')
+            self.plane.to_avl_file(avl_filepath)
+            
+            # 3. Save .mass Inertia File
+            mass_filepath = filepath.replace('_project.json', '.mass').replace('.json', '.mass')
+            self.plane.to_mass_file(mass_filepath)
+            
+            # 4. Save a basic .run file for VibeLattice completeness
+            run_filepath = filepath.replace('_project.json', '.run').replace('.json', '.run')
+            with open(run_filepath, 'w') as f:
+                f.write(f"---------------------------------------------\n")
+                f.write(f"Run case  1:  Default Level Flight\n\n")
+                f.write(f" alpha        ->  alpha       =   0.00000\n")
+                f.write(f" beta         ->  beta        =   0.00000\n")
+                f.write(f" pb/2V        ->  pb/2V       =   0.00000\n")
+                f.write(f" qc/2V        ->  qc/2V       =   0.00000\n")
+                f.write(f" rb/2V        ->  rb/2V       =   0.00000\n")
+            
+            QMessageBox.information(self, "Success", f"Project completely saved!\n\nFiles generated in {self.last_directory}:\n- {os.path.basename(filepath)}\n- {os.path.basename(avl_filepath)}\n- {os.path.basename(mass_filepath)}\n- {os.path.basename(run_filepath)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save project:\n{str(e)}")
 
@@ -1688,6 +1764,97 @@ class AVLDesktopApp(QMainWindow):
         self.canvas_bp.fig.tight_layout(pad=2.0)
         self.canvas_bp.draw()
 
+    def setup_vibelattice_tab(self):
+        vibe_tab = QWidget()
+        self.main_tabs.addTab(vibe_tab, "VibeLattice")
+        lay = QVBoxLayout(vibe_tab)
+        lay.setContentsMargins(0, 0, 0, 0)
+        
+        if hasattr(self, 'vibe_port'):
+            self.vibe_browser = QWebEngineView(self)
+            self.vibe_profile = QWebEngineProfile("VibeProfile", self.vibe_browser)
+            self.vibe_profile.setPersistentCookiesPolicy(QWebEngineProfile.NoPersistentCookies)
+            # Use isolated cache
+            self.vibe_profile.setCachePath(os.path.join(os.path.dirname(__file__), "QtWebEngineData"))
+            self.vibe_profile.setPersistentStoragePath(os.path.join(os.path.dirname(__file__), "QtWebEngineData"))
+            self.vibe_profile.clearHttpCache()
+            
+            # Subclass QWebEnginePage to intercept console messages
+            class CustomWebEnginePage(QWebEnginePage):
+                def javaScriptConsoleMessage(self, level, msg, line, source):
+                    print(f"JS Console: {msg} (Line {line})")
+                    super().javaScriptConsoleMessage(level, msg, line, source)
+                    
+            # Attach the custom profile to a new page so it actually uses the isolated cache!
+            self.vibe_page = CustomWebEnginePage(self.vibe_profile, self.vibe_browser)
+            self.vibe_browser.setPage(self.vibe_page)
+            
+            # Start VibeLattice (cache-bust just in case the old blank one was cached)
+            import time
+            self.vibe_browser.setUrl(QUrl(f"http://localhost:{self.vibe_port}/?t={time.time()}"))
+            lay.addWidget(self.vibe_browser)
+        else:
+            lay.addWidget(QLabel("VibeLattice server failed to start."))
+
+    def push_to_vibelattice(self):
+        try:
+            runs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "vibelattice", "third_party", "avl", "runs"))
+            if not os.path.exists(runs_dir):
+                os.makedirs(runs_dir)
+            
+            # Save the AVL and Mass strings
+            avl_str = self.plane.to_avl_string()
+            mass_str = self.plane.to_mass_string()
+            
+            avl_path = os.path.join(runs_dir, "custom.avl")
+            mass_path = os.path.join(runs_dir, "custom.mass")
+            
+            with open(avl_path, "w") as f:
+                f.write(avl_str)
+            with open(mass_path, "w") as f:
+                f.write(mass_str)
+                
+            # Execute JS in the webview to update the text areas and trigger a load.
+            js_avl = json.dumps(avl_str)
+            js_mass = json.dumps(mass_str)
+            
+            js_code = f"""
+            var avl_str = {js_avl};
+            var mass_str = {js_mass};
+            
+            function simulateFileUpload(inputId, fileContent, fileName) {{
+                var fileInput = document.getElementById(inputId);
+                if (!fileInput) return false;
+                
+                var file = new File([fileContent], fileName, {{ type: "text/plain" }});
+                var dt = new DataTransfer();
+                dt.items.add(file);
+                fileInput.files = dt.files;
+                
+                var event = new Event('change', {{ bubbles: true }});
+                fileInput.dispatchEvent(event);
+                return true;
+            }}
+            
+            // Upload geometry
+            simulateFileUpload('fileInput', avl_str, 'custom.avl');
+            
+            // Upload mass
+            setTimeout(() => {{
+                simulateFileUpload('massPropsInput', mass_str, 'custom.mass');
+                
+                // Switch to plots
+                var navPlots = document.getElementById('navPlots');
+                if (navPlots) navPlots.click();
+            }}, 100);
+            """
+            if hasattr(self, 'vibe_browser'):
+                self.vibe_browser.page().runJavaScript(js_code)
+                self.main_tabs.setCurrentIndex(1)
+                
+            QMessageBox.information(self, "Success", "Plane geometry pushed to VibeLattice!")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to push to VibeLattice:\n{str(e)}")
 
 
 class OutputReaderThread(QThread):
@@ -1816,8 +1983,11 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--enable-webgl --ignore-gpu-blocklist"
+    
+    
+    data_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "QtWebEngineData"))
+    
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     app.setWindowIcon(QIcon("icon.png"))

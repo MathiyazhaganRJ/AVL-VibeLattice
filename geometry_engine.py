@@ -373,11 +373,14 @@ class Airplane:
             f"",
             f"#-------------------------",
             f"#  Mass    X      Y      Z      Ixx    Iyy    Izz    Ixy    Ixz    Iyz",
-            f"*"
+            f"*   1.0   1.0   1.0   1.0"
         ]
         
-        for m in self.point_masses:
-            lines.append(f"   {m.mass:.3f}   {m.x:.3f}   {m.y:.3f}   {m.z:.3f}   0.0    0.0    0.0    0.0    0.0    0.0   ! {m.name}")
+        if not self.point_masses:
+            lines.append(f"   1.000   0.000   0.000   0.000   0.0    0.0    0.0    0.0    0.0    0.0   ! Default Mass")
+        else:
+            for m in self.point_masses:
+                lines.append(f"   {m.mass:.3f}   {m.x:.3f}   {m.y:.3f}   {m.z:.3f}   0.0    0.0    0.0    0.0    0.0    0.0   ! {m.name}")
             
         return "\n".join(lines) + "\n"
 
